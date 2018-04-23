@@ -1,0 +1,221 @@
+kind: StorageClass
+apiVersion: storage.k8s.io/v1beta1
+metadata:
+  name: pingcap-volume-provisioner
+provisioner: pingcap.com/volume-provisioner
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lvm-scheduler
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lvm-volume-manager
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: default:lvm-scheduler
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: default:lvm-scheduler
+subjects:
+- kind: ServiceAccount
+  name: lvm-scheduler
+roleRef:
+  kind: ClusterRole
+  name: default:lvm-scheduler
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: default:kube-scheduler
+subjects:
+- kind: ServiceAccount
+  name: lvm-scheduler
+roleRef:
+  kind: ClusterRole
+  name: system:kube-scheduler
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: default:lvm-volume-manager
+rules:
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "create", "watch"]
+- apiGroups: [""]
+  resources: ["persistentvolumes", "persistentvolumeclaims"]
+  verbs: ["*"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: default:lvm-volume-manager
+subjects:
+- kind: ServiceAccount
+  name: lvm-volume-manager
+roleRef:
+  kind: ClusterRole
+  name: default:lvm-volume-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lvm-scheduler-policy
+data:
+  policy.cfg: |-
+    {
+            "kind" : "Policy",
+            "apiVersion" : "v1",
+            "predicates": [
+                    {"name": "MatchNodeSelector"},
+                    {"name": "PodFitsResources"},
+                    {"name": "PodFitsHostPorts"},
+                    {"name": "HostName"},
+                    {"name": "NoDiskConflict"},
+                    {"name": "PodToleratesNodeTaints"},
+                    {"name": "CheckNodeMemoryPressure"},
+                    {"name": "CheckNodeDiskPressure"},
+                    {"name": "MatchInterPodAffinity"},
+                    {"name": "GeneralPredicates"}
+            ],
+            "priorities": [
+                    {"name": "EqualPriority", "weight": 1},
+                    {"name": "ImageLocalityPriority", "weight": 1},
+                    {"name": "LeastRequestedPriority", "weight": 1},
+                    {"name": "BalancedResourceAllocation", "weight": 1},
+                    {"name": "SelectorSpreadPriority", "weight": 1},
+                    {"name": "NodePreferAvoidPodsPriority", "weight": 1},
+                    {"name": "NodeAffinityPriority", "weight": 1},
+                    {"name": "TaintTolerationPriority", "weight": 1},
+                    {"name": "MostRequestedPriority", "weight": 1}
+            ],
+            "extenders": [
+                    {
+                            "urlPrefix": "http://127.0.0.1:10262/scheduler",
+                            "filterVerb": "filter",
+                            "weight": 1,
+                            "httpTimeout": 30000000000,
+                            "enableHttps": false
+                    }
+            ]
+    }
+
+---
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+  name: lvm-volume-manager
+spec:
+  selector:
+    matchLabels:
+      app: lvm-volume-manager
+    template:
+      metadata:
+        labels:
+          app: lvm-volume-manager
+      spec:
+        serviceAccount: lvm-volume-manager
+        containers:
+        - name: lvm-volume-manager
+          image: localhost:5000/pingcap/lvm-manager:latest
+          securityContext:
+            privileged: true
+          command:
+          - lvm-volume-manager
+          - --fs-type=ext4
+          - --domain-name=pingcap.com
+          volumeMounts:
+          - name: data
+            mountPath: /data
+          env:
+          - name: MY_NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        volumes:
+        - name: data
+          hostPath:
+            path: /data
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: lvm-scheduler
+  labels:
+    app: lvm-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lvm-scheduler
+  template:
+    metadata:
+      labels:
+        app: lvm-scheduler
+    spec:
+      serviceAccount: lvm-scheduler
+      containers:
+      - name: lvm-scheduler
+        image: localhost:5000/pingcap/lvm-manager:latest
+        command:
+          - lvm-scheduler
+          - --port=10262
+        env:
+          - name: MY_POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+        volumeMounts:
+          - name: timezone
+            mountPath: /etc/localtime
+      - name: kube-scheduler
+        image: quay.io/coreos/hyperkube:v1.7.2_coreos.0
+        command:
+        - /hyperkube
+        - scheduler
+        - --port=10261
+        - --leader-elect=true
+        - --lock-object-name=lvm-scheduler
+        - --lock-object-namespace=default
+        - --scheduler-name=lvm-scheduler
+        - --v=4
+        - --policy-configmap=lvm-scheduler-policy
+        - --policy-configmap-namespace=default
+        # TODO: find the reason why health-check failed and uncomment following lines
+        # livenessProbe:
+        #   httpGet:
+        #     host: 127.0.0.1
+        #     path: /healthz
+        #     port: 10261
+        #   initialDelaySeconds: 30
+        #   timeoutSeconds: 10
+        volumeMounts:
+          - name: timezone
+            mountPath: /etc/localtime
+      volumes:
+      - name: timezone
+        hostPath:
+          path: /etc/localtime
