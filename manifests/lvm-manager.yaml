@@ -1,8 +1,8 @@
 kind: StorageClass
 apiVersion: storage.k8s.io/v1beta1
 metadata:
-  name: pingcap-volume-provisioner
-provisioner: pingcap.com/volume-provisioner
+  name: lvm-volume-provisioner
+provisioner: pingcap.com/lvm-volume-provisioner
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -14,6 +14,11 @@ kind: ServiceAccount
 metadata:
   name: lvm-volume-manager
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lvm-volume-provisioner
+---
 apiVersion: rbac.authorization.k8s.io/v1beta1
 kind: ClusterRole
 metadata:
@@ -23,8 +28,39 @@ rules:
   resources: ["configmaps"]
   verbs: ["get"]
 - apiGroups: [""]
-  resources: ["persistentvolumeclaims"]
+  resources: ["endpoints", "persistentvolumeclaims"]
   verbs: ["get", "list", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: default:lvm-volume-provisioner
+rules:
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "create", "watch", "patch"]
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get", "list", "watch", "update"]
+- apiGroups: [""]
+  resources: ["persistentvolumes", "persistentvolumeclaims"]
+  verbs: ["*"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: default:lvm-volume-provisioner
+subjects:
+- kind: ServiceAccount
+  name: lvm-volume-provisioner
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: default:lvm-volume-provisioner
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1beta1
 kind: ClusterRoleBinding
@@ -33,9 +69,23 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: lvm-scheduler
+  namespace: default
 roleRef:
   kind: ClusterRole
   name: default:lvm-scheduler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: default:kube-scheduler
+subjects:
+- kind: ServiceAccount
+  name: lvm-scheduler
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: system:kube-scheduler
   apiGroup: rbac.authorization.k8s.io
 ---
 kind: ClusterRoleBinding
@@ -45,6 +95,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: lvm-scheduler
+  namespace: default
 roleRef:
   kind: ClusterRole
   name: system:kube-scheduler
@@ -56,17 +107,14 @@ metadata:
   name: default:lvm-volume-manager
 rules:
 - apiGroups: [""]
-  resources: ["events"]
-  verbs: ["get", "list", "create", "watch"]
-- apiGroups: [""]
   resources: ["persistentvolumes", "persistentvolumeclaims"]
   verbs: ["*"]
 - apiGroups: [""]
-  resources: ["pods"]
+  resources: ["pods", "nodes"]
   verbs: ["get", "list", "watch"]
-- apiGroups: ["storage.k8s.io"]
-  resources: ["storageclasses"]
-  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes/status"]
+  verbs: ["patch"]
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1beta1
@@ -75,6 +123,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: lvm-volume-manager
+  namespace: default
 roleRef:
   kind: ClusterRole
   name: default:lvm-volume-manager
@@ -132,33 +181,69 @@ spec:
   selector:
     matchLabels:
       app: lvm-volume-manager
-    template:
-      metadata:
-        labels:
-          app: lvm-volume-manager
-      spec:
-        serviceAccount: lvm-volume-manager
-        containers:
-        - name: lvm-volume-manager
-          image: localhost:5000/pingcap/lvm-manager:latest
-          securityContext:
-            privileged: true
-          command:
-          - lvm-volume-manager
-          - --fs-type=ext4
-          - --domain-name=pingcap.com
-          volumeMounts:
-          - name: data
-            mountPath: /data
-          env:
-          - name: MY_NODE_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: spec.nodeName
-        volumes:
+  template:
+    metadata:
+      labels:
+        app: lvm-volume-manager
+    spec:
+      serviceAccount: lvm-volume-manager
+      containers:
+      - name: lvm-volume-manager
+        image: localhost:5000/pingcap/lvm-manager:latest
+        securityContext:
+          privileged: true
+        command:
+        - lvm-volume-manager
+        - --fs-type=ext4
+        - --workers=5
+        - --base-dir=/data
+        - --domain-name=pingcap.com
+        - --logtostderr
+        volumeMounts:
         - name: data
-          hostPath:
-            path: /data
+          mountPath: /data
+        env:
+        - name: MY_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+      volumes:
+      - name: data
+        hostPath:
+          path: /data
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: lvm-provisioner
+  labels:
+    app: lvm-provisioner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lvm-provisioner
+  template:
+    metadata:
+      labels:
+        app: lvm-provisioner
+    spec:
+      serviceAccount: lvm-volume-provisioner
+      containers:
+      - name: lvm-provisioner
+        image: localhost:5000/pingcap/lvm-manager:latest
+        command:
+        - lvm-volume-provisioner
+        - --domain-name=pingcap.com
+        - --kube-version=v1.9.5
+        - --logtostderr
+        volumeMounts:
+        - name: timezone
+          mountPath: /etc/localtime
+      volumes:
+      - name: timezone
+        hostPath:
+          path: /etc/localtime
 ---
 apiVersion: extensions/v1beta1
 kind: Deployment
@@ -183,6 +268,7 @@ spec:
         command:
           - lvm-scheduler
           - --port=10262
+          - --logtostderr
         env:
           - name: MY_POD_NAMESPACE
             valueFrom:
@@ -192,7 +278,7 @@ spec:
           - name: timezone
             mountPath: /etc/localtime
       - name: kube-scheduler
-        image: quay.io/coreos/hyperkube:v1.7.2_coreos.0
+        image: uhub.ucloud.cn/pingcap/hyperkube:v1.9.5
         command:
         - /hyperkube
         - scheduler

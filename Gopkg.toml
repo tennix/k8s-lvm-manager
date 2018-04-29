@@ -1,0 +1,31 @@
+[[constraint]]
+  version = "2.7.0"
+  name = "github.com/emicklei/go-restful"
+
+[[constraint]]
+  version = "1.10.0-beta.0"
+  name = "k8s.io/kubernetes"
+
+[[constraint]]
+  version = "kubernetes-1.10.0-beta.1"
+  name = "k8s.io/api"
+
+[[constraint]]
+  version = "kubernetes-1.10.0-beta.1"
+  name = "k8s.io/apimachinery"
+
+[[constraint]]
+  version = "kubernetes-1.10.0-beta.1"
+  name = "k8s.io/client-go"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/golang/glog"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/kubernetes-incubator/external-storage"
+
+[prune]
+  go-tests = true
+  unused-packages = true
