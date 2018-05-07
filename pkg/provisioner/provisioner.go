@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/golang/glog"
 	"github.com/kubernetes-incubator/external-storage/lib/controller"
@@ -39,12 +40,9 @@ func (c *Controller) Provision(opts controller.VolumeOptions) (*v1.PersistentVol
 		glog.Infof("pvc %s/%s doesn't contain podName annotation", ns, name)
 		return nil, errors.New("pvc doesn't contain podName annotation")
 	}
-	// pod, err := c.kubeCli.CoreV1().Pods(ns).Get(podName, metav1.GetOptions{})
-	// if err != nil {
-	// 	glog.Errorf("failed to get pod %s/%s: %v", ns, podName, err)
-	// 	return nil, err
-	// }
 
+	lvName := ann[util.AnnProvisionerLVName]
+	vgName := ann[util.AnnProvisionerVGName]
 	hostPath, ok := ann[util.AnnProvisionerHostPath]
 	if ok && hostPath != "" {
 		return &v1.PersistentVolume{
@@ -54,6 +52,8 @@ func (c *Controller) Provision(opts controller.VolumeOptions) (*v1.PersistentVol
 					util.AnnProvisionerNode:     nodeName,
 					util.AnnProvisionerHostPath: hostPath,
 					util.AnnProvisionerPodName:  podName,
+					util.AnnProvisionerLVName:   lvName,
+					util.AnnProvisionerVGName:   vgName,
 				},
 			},
 			Spec: v1.PersistentVolumeSpec{
@@ -74,14 +74,12 @@ func (c *Controller) Provision(opts controller.VolumeOptions) (*v1.PersistentVol
 }
 
 func (c *Controller) Delete(pv *v1.PersistentVolume) error {
-	// pvName := pv.GetName()
-	// ann := pv.GetAnnotations()
-	// node := ann[util.AnnProvisionerNode]
-	// if node != c.nodeName {
-	// 	return &controller.IgnoredError{fmt.Sprintf("PV[%s] is not managed by this provisioner, managed by: %s, skipping", pvName, node)}
-	// }
-
-	// lvName := ann[AnnProvisionerLVName]
-
-	return nil
+	pvName := pv.GetName()
+	ann := pv.GetAnnotations()
+	lvName := ann[util.AnnProvisionerLVName]
+	lvDeleted := ann[util.AnnProvisionerLVDeleted]
+	if lvDeleted == "true" {
+		return nil
+	}
+	return &controller.IgnoredError{fmt.Sprintf("waiting for LV %s deleted before deleting PV %s", lvName, pvName)}
 }

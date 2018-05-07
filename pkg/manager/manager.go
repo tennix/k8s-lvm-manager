@@ -2,15 +2,18 @@ package manager
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 	"os/exec"
 	"path"
+	"strings"
 
 	"github.com/golang/glog"
 )
 
 type LVManager struct {
 	BaseDir string
-	LVM     LVM
+	LVM     map[string]VolumeGroup
 }
 
 type LVMReport struct {
@@ -49,16 +52,34 @@ type VG struct {
 	VGTags  string `json:"vg_tags"`
 }
 
-type LVM struct {
-	PV map[string]PV
-	VG map[string]VG
-	LV map[string]LV
+type PhysicalVolume struct {
+	UUID string
+	Name string
+	Size string
+	Free string
+}
+
+type LogicalVolume struct {
+	UUID string
+	Name string
+	Size string
+	Path string
+}
+
+type VolumeGroup struct {
+	UUID string
+	Name string
+	Size string
+	Free string
+	Tags []string
+	PVs  map[string]PhysicalVolume
+	LVs  map[string]LogicalVolume
 }
 
 func scanLVM() (LVMReport, error) {
 	var report LVMReport
 	vg_cols := "vg_uuid,vg_name,vg_size,vg_free,lv_count,pv_count,vg_tags"
-	vgs, err := exec.Command("vgs", "loopback-disk", "-o", vg_cols, "--reportformat", "json").Output()
+	vgs, err := exec.Command("vgs", "-o", vg_cols, "--units", "H", "--reportformat", "json").Output()
 	if err != nil {
 		glog.Errorf("failed to list vg: %v", err)
 		return report, err
@@ -71,7 +92,7 @@ func scanLVM() (LVMReport, error) {
 	glog.Infof("lvm: %+v", report)
 
 	pv_cols := "pv_uuid,pv_name,vg_name,pv_size,pv_free"
-	pvs, err := exec.Command("pvs", "-o", pv_cols, "--reportformat", "json").Output()
+	pvs, err := exec.Command("pvs", "-o", pv_cols, "--units", "H", "--reportformat", "json").Output()
 	if err != nil {
 		glog.Errorf("failed to list pv: %v", err)
 		return report, err
@@ -84,7 +105,7 @@ func scanLVM() (LVMReport, error) {
 	glog.Infof("lvm: %+v", report)
 
 	lv_cols := "lv_uuid,lv_name,lv_size,lv_path,vg_name"
-	lvs, err := exec.Command("lvs", "-o", lv_cols, "--reportformat", "json").Output()
+	lvs, err := exec.Command("lvs", "-o", lv_cols, "--units", "H", "--reportformat", "json").Output()
 	if err != nil {
 		glog.Errorf("failed to list lv: %v", err)
 		return report, err
@@ -99,66 +120,96 @@ func scanLVM() (LVMReport, error) {
 }
 
 func (m *LVManager) SyncLVMStatus() error {
-	pvs := map[string]PV{}
-	vgs := map[string]VG{}
-	lvs := map[string]LV{}
+	vgs := map[string]VolumeGroup{}
 	report, err := scanLVM()
 	if err != nil {
 		return err
 	}
 	for _, lvm := range report.Report {
 		for _, vg := range lvm.VG {
-			vgs[vg.VGName] = vg
+			vgs[vg.VGName] = VolumeGroup{
+				UUID: vg.VGUUID,
+				Name: vg.VGName,
+				Size: vg.VGSize,
+				Free: vg.VGFree,
+				PVs:  make(map[string]PhysicalVolume),
+				LVs:  make(map[string]LogicalVolume),
+				Tags: strings.Split(vg.VGTags, ","),
+			}
 		}
 		for _, pv := range lvm.PV {
-			pvs[pv.PVName] = pv
+			p := PhysicalVolume{
+				UUID: pv.PVUUID,
+				Name: pv.PVName,
+				Size: pv.PVSize,
+				Free: pv.PVFree,
+			}
+			pvs := vgs[pv.VGName].PVs
+			pvs[pv.PVName] = p
 		}
 		for _, lv := range lvm.LV {
-			lvs[lv.LVName] = lv
+			l := LogicalVolume{
+				UUID: lv.LVUUID,
+				Name: lv.LVName,
+				Size: lv.LVSize,
+				Path: lv.LVPath,
+			}
+			lvs := vgs[lv.VGName].LVs
+			lvs[lv.LVName] = l
 		}
 	}
-	m.LVM = LVM{
-		PV: pvs,
-		VG: vgs,
-		LV: lvs,
-	}
+	m.LVM = vgs
 	return nil
 }
 
 func (m *LVManager) AllocateLV(lvName, vgName string, size string) error {
-	output, err := exec.Command("lvcreate", "--name", lvName, "--size", size, vgName).Output()
+	vg, ok := m.LVM[vgName]
+	if !ok {
+		return fmt.Errorf("no vg named %s", vgName)
+	}
+	if _, ok := vg.LVs[lvName]; ok {
+		glog.Infof("lv %s already exist", lvName)
+		return nil
+	}
+	output, err := exec.Command("lvcreate", "--zero", "n", "--name", lvName, "--size", size, vgName).Output()
 	if err != nil {
 		glog.Errorf("failed to create LV %s with size %s: %v", lvName, size, err)
 		return err
 	}
-	glog.Infof("lvcreate output: %s\n", output)
+	glog.Infof("lvcreate output: %s", output)
 	return nil
 }
 
-func (m *LVManager) FormatLV(name string, fsType string) error {
-	output, err := exec.Command("mkfs", "--type", fsType, name).Output()
+func (m *LVManager) FormatLV(lvName, vgName string, fsType string) error {
+	devPath := getDevPath(lvName, vgName)
+	output, err := exec.Command("mkfs", "--type", fsType, devPath).Output()
 	if err != nil {
-		glog.Errorf("failed to format LV %s to %s: %v", name, fsType, err)
+		glog.Errorf("failed to format LV %s to %s: %v", devPath, fsType, err)
 		return err
 	}
-	glog.Infof("mkfs output: %s\n", output)
+	glog.Infof("mkfs output: %s", output)
 	return nil
 }
 
-func (m *LVManager) MountLV(name string) error {
-	dir := path.Join(m.BaseDir, name)
-	output, err := exec.Command("mount", name, dir).Output()
-	if err != nil {
-		glog.Infof("failed to mount LV %s to %s: %v", name, dir, err)
-		return err
+func (m *LVManager) MountLV(lvName, vgName string) (string, error) {
+	mntPath := path.Join(m.BaseDir, lvName)
+	if err := os.MkdirAll(mntPath, os.ModeDir); err != nil {
+		glog.Errorf("failed to create mount directory %s: %v", mntPath, err)
+		return "", err
 	}
-	glog.Infof("mount output: %s\n", output)
-	return nil
+	devPath := getDevPath(lvName, vgName)
+	output, err := exec.Command("mount", devPath, mntPath).Output()
+	if err != nil {
+		glog.Infof("failed to mount LV %s to %s: %v", devPath, mntPath, err)
+		return "", err
+	}
+	glog.Infof("mount output: %s", output)
+	return mntPath, nil
 }
 
 func (m *LVManager) UnmountLV(name string) error {
-	dir := path.Join(m.BaseDir, name)
-	output, err := exec.Command("umount", dir).Output()
+	mntPath := path.Join(m.BaseDir, name)
+	output, err := exec.Command("umount", mntPath).Output()
 	if err != nil {
 		glog.Errorf("failed to umount LV %s: %v", name, err)
 		return err
@@ -167,10 +218,11 @@ func (m *LVManager) UnmountLV(name string) error {
 	return nil
 }
 
-func (m *LVManager) RemoveLV(name string) error {
-	output, err := exec.Command("lvremove", name, "--yes").Output()
+func (m *LVManager) RemoveLV(lvName string, vgName string) error {
+	devPath := getDevPath(lvName, vgName)
+	output, err := exec.Command("lvremove", devPath, "--yes").Output()
 	if err != nil {
-		glog.Errorf("failed to remove LV %s: %v", name, err)
+		glog.Errorf("failed to remove LV %s: %v", devPath, err)
 		return err
 	}
 	glog.Infof("lvremove output: %s", output)
@@ -207,3 +259,13 @@ func (m *LVManager) RemoveLV(name string) error {
 // 		t.fsTable = append(t.fsTable, row)
 // 	}
 // }
+
+func getDevPath(lvName, vgName string) string {
+	return path.Join(
+		"/dev/mapper",
+		fmt.Sprintf("%s-%s",
+			strings.Replace(vgName, "-", "--", -1),
+			strings.Replace(lvName, "-", "--", -1),
+		),
+	)
+}

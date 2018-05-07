@@ -90,7 +90,7 @@ func main() {
 
 	controller := manager.NewController(cli, mgr, domainName, nodeName, provisionerName)
 
-	if err := controller.UpdateNodeStatus(mgr.LVM.VG); err != nil {
+	if err := controller.UpdateNodeStatus(mgr.LVM); err != nil {
 		glog.Fatalf("failed to update node status: %v", err)
 	}
 	wait.Forever(func() {

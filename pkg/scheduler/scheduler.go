@@ -105,11 +105,14 @@ func (ls *lvmScheduler) Filter(args *schedulerapiv1.ExtenderArgs) (*schedulerapi
 		}
 	}
 
-	node := args.Nodes.Items[0] // simply select the first nodes
+	nodeName := pvc.Annotations[util.AnnProvisionerNode]
+	if nodeName == "" {
+		nodeName = args.Nodes.Items[0].GetName() // simply select the first node
+	}
 	lvName := ns + "-" + pvcName
 	pvc.Annotations[util.AnnProvisionerLVName] = lvName
 	pvc.Annotations[util.AnnProvisionerVGName] = vgName
-	pvc.Annotations[util.AnnProvisionerNode] = node.GetName()
+	pvc.Annotations[util.AnnProvisionerNode] = nodeName
 	pvc.Annotations[util.AnnProvisionerPodName] = podName
 	pvc.Annotations[util.AnnProvisionerHostPath] = ""
 	pvc.Annotations[util.AnnProvisionerLVSize] = size

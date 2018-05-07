@@ -9,6 +9,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/tennix/k8s-lvm-manager/pkg/util"
 	"k8s.io/api/core/v1"
+	apierr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -92,6 +93,9 @@ func (c *Controller) worker() {
 			if err := c.syncPVC(key.(string)); err != nil {
 				glog.Error(err)
 			}
+			if err := c.lvm.SyncLVMStatus(); err != nil {
+				glog.Error(err)
+			}
 		}()
 	}
 }
@@ -119,7 +123,7 @@ func (c *Controller) syncPVC(key string) error {
 		return err
 	}
 	if !exists {
-		return nil
+		return c.ReleaseLV(ns, pvcName)
 	}
 	pvc, ok := obj.(*v1.PersistentVolumeClaim)
 	if !ok {
@@ -140,21 +144,30 @@ func (c *Controller) syncPVC(key string) error {
 	vgName := ann[util.AnnProvisionerVGName]
 	lvName := ann[util.AnnProvisionerLVName]
 	size := ann[util.AnnProvisionerLVSize]
-	fsType := ann[util.AnnProvisionerLVFsType]
+	// fsType := ann[util.AnnProvisionerLVFsType]
+	fsType := "ext4"
 	if err := c.lvm.AllocateLV(lvName, vgName, size); err != nil {
 		glog.Errorf("failed to allocate LV")
 		return err
 	}
-	if err := c.lvm.FormatLV(lvName, fsType); err != nil {
+	if err := c.lvm.FormatLV(lvName, vgName, fsType); err != nil {
 		return err
 	}
-	if err := c.lvm.MountLV(lvName); err != nil {
+	hostPath, err = c.lvm.MountLV(lvName, vgName)
+	if err != nil {
 		return err
 	}
+	ann[util.AnnProvisionerHostPath] = hostPath
+	_, err = c.kubeCli.CoreV1().PersistentVolumeClaims(ns).Update(pvc)
+	if err != nil {
+		glog.Errorf("failed to update PVC %s/%s: %v", ns, pvcName, err)
+		return err
+	}
+
 	return nil
 }
 
-func (c *Controller) UpdateNodeStatus(vgs map[string]VG) error {
+func (c *Controller) UpdateNodeStatus(vgs map[string]VolumeGroup) error {
 	if len(vgs) == 0 {
 		return nil
 	}
@@ -165,8 +178,8 @@ func (c *Controller) UpdateNodeStatus(vgs map[string]VG) error {
 	patches := []NodePatch{
 		{
 			Op:    "add",
-			Path:  fmt.Sprintf("/status/capacity/%s~1%s", c.domainName, vg.VGName),
-			Value: strings.ToUpper(vg.VGSize),
+			Path:  fmt.Sprintf("/status/capacity/%s~1%s", c.domainName, vg.Name),
+			Value: strings.ToUpper(vg.Size),
 		},
 	}
 	data, err := json.Marshal(patches)
@@ -181,4 +194,56 @@ func (c *Controller) UpdateNodeStatus(vgs map[string]VG) error {
 		return err
 	}
 	return nil
+}
+
+func (c *Controller) ReleaseLV(pvcNamespace, pvcName string) error {
+	opts := metav1.ListOptions{}
+	pvList, err := c.kubeCli.CoreV1().PersistentVolumes().List(opts)
+	if err != nil {
+		glog.Errorf("failed to list pv")
+		return err
+	}
+	var pv *v1.PersistentVolume
+	for _, item := range pvList.Items {
+		ref := item.Spec.ClaimRef
+		if ref != nil && ref.Namespace == pvcNamespace && ref.Name == pvcName {
+			pv = &item
+			break
+		}
+	}
+	if pv == nil {
+		glog.Infof("no pv found for pvc %s/%s", pvcNamespace, pvcName)
+		return nil
+	}
+	pvName := pv.GetName()
+	ann := pv.GetAnnotations()
+	if node := ann[util.AnnProvisionerNode]; node != c.nodeName {
+		glog.Infof("pv %s not managed by me", pvName)
+		return nil
+	}
+	lvName := ann[util.AnnProvisionerLVName]
+	vgName := ann[util.AnnProvisionerVGName]
+	if err := c.lvm.UnmountLV(lvName); err != nil {
+		return err
+	}
+	if err := c.lvm.RemoveLV(lvName, vgName); err != nil {
+		return err
+	}
+	return wait.Poll(3*time.Second, 30*time.Second, func() (bool, error) {
+		pv.Annotations[util.AnnProvisionerLVDeleted] = "true"
+		_, err = c.kubeCli.CoreV1().PersistentVolumes().Update(pv)
+		if err == nil {
+			return true, nil
+		}
+		if apierr.IsConflict(err) {
+			pv, err = c.kubeCli.CoreV1().PersistentVolumes().Get(pvName, metav1.GetOptions{})
+			if err != nil {
+				glog.Errorf("failed to get PV %s: %v", pvName, err)
+				return false, nil
+			}
+			return false, nil
+		}
+		glog.Errorf("failed to update PV %s annotations: %v", pvName, err)
+		return false, nil
+	})
 }
